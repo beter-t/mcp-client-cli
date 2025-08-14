@@ -22,11 +22,11 @@ type OpenAIChatMessage = OpenAI.ChatCompletionMessage | OpenAI.ChatCompletionUse
 class MCPClient {
   private mcpClient: Client;
   private openAI: OpenAI;
-  private transport: StdioClientTransport | null = null;
-  private messages: OpenAIChatMessage[];
-  private openAITools: OpenAI.ChatCompletionTool[] = [];
+  private transport: StdioClientTransport | null = null; // transport layer
+  private messages: OpenAIChatMessage[]; // chat history / context
+  private openAITools: OpenAI.ChatCompletionTool[] = []; // list of tools available
 
-  constructor(systemPrompt: string, private onNewMessage?: (message: OpenAIChatMessage) => void) {
+  constructor(systemPrompt: string) {
     this.openAI = new OpenAI({
       apiKey: GEMINI_API_KEY,
       baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -35,6 +35,7 @@ class MCPClient {
     this.messages = [{role: "system", content: systemPrompt}];
   }
 
+  /* Connect to MCP server */
   async connectToServer(serverScriptPath: string) {
     try {
       const isJs = serverScriptPath.endsWith(".js");
@@ -51,6 +52,7 @@ class MCPClient {
       await this.mcpClient.connect(this.transport);
 
       const mcpTools = await this.mcpClient.listTools();
+      console.log(JSON.stringify(mcpTools))
       this.openAITools = mcpTools.tools.map(tool => ({
         type: "function",
         function: {
@@ -58,13 +60,14 @@ class MCPClient {
           description: tool.description,
           parameters: {
             type: tool.inputSchema.type,
-            properties: tool.inputSchema.properties
+            properties: tool.inputSchema.properties,
+            required: tool.inputSchema?.required
           }
         }
       }));
 
       console.log(
-        "Connected to MCP server with tools:",
+        "Connected to MCP server with the tools:",
         this.openAITools.map(tool => tool.function.name)
       );
     } catch (err) {
@@ -73,27 +76,30 @@ class MCPClient {
     }
   }
 
-  async processQuery(query: string) {
+  /* Process messages and tool calls */
+  private async processMessage(message: string) {
+    // Add user's message to message history
     this.addMessage({
       role: "user",
-      content: query
+      content: message
     });
 
+    // Get initial LLM response; may include tool calls
     const initialResponse = await this.openAI.chat.completions.create({
       model: "gemini-2.5-flash",
-      reasoning_effort: "low",
+      //reasoning_effort: "low",
       messages: this.messages,
       tools: this.openAITools
     })
-
     const assistantMessage = initialResponse.choices[0].message;
     this.addMessage(assistantMessage);
 
+    // Get list of tool calls, if any
     let toolCalls = assistantMessage.tool_calls;
     if (!toolCalls || toolCalls.length === 0) return; // finished here if no tools needed
 
+    // Call all the needed tools and add the tools' responses to the message history
     while (toolCalls && toolCalls.length > 0) {
-      // Call all the needed tools and add the tools' responses to the chat history
       for (const toolCall of toolCalls) {
         const toolCallResult = await this.mcpClient.callTool({
           name: toolCall.function.name,
@@ -109,10 +115,10 @@ class MCPClient {
         this.addMessage(toolMessage);
       }
 
-      // Provide the LLM the updated chat history containing the tool call results and get its response
+      // Provide the LLM the updated message history containing the tool call results and get its response
       const toolCallFollowUpResponse = await this.openAI.chat.completions.create({
         model: "gemini-2.5-flash",
-        reasoning_effort: "low",
+        //reasoning_effort: "low",
         messages: this.messages,
         tools: this.openAITools
       });
@@ -123,33 +129,62 @@ class MCPClient {
     }
   }
   
+  /* Append message to message history */
   private addMessage(message: OpenAIChatMessage) {
     this.messages.push(message);
-    this.onNewMessage?.(message);
+
+    // Print to console
+    const role = message.role.toUpperCase();
+    if (role === "USER") return;
+    if (role === "TOOL") return;
+    if (message.content) console.log(`\n${role}: ${message.content}`);
   }
 
-  private async chatLoop() {
+  /* The chat loop; waits for user input */
+  async chatLoop() {
     // Create readline interface for user input
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout
     });
 
-    
-
     try {
       console.log("\nMCP Client started!");
+      console.log("You may now chat with the assistant.");
       console.log("Type your queries or 'quit' to exit.");
+
+      while (true) {
+        const message = await rl.question("\nUSER: ");
+        if (message.toLowerCase() === "quit") {
+          break;
+        }
+        await this.processMessage(message);
+      }
     } finally {
       rl.close();
     }
   }
+
+  async cleanup() {
+    await this.mcpClient.close();
+  }
 }
 
 async function main() {
-  const myMCPClient = new MCPClient("You are an assistant who supports your user. You will have access to a list of tools and resources that you may need to respond to the user's messages properly.");
+  if (process.argv.length < 3) {
+    console.log("Usage: node build/index.js <path_to_server_script"); // e.g. node build/index.js "../MCP Servers/node_modules/time-mcp/dist/index.js"
+    return;
+  }
 
-  console.log("MCP Client started.");
-  console.log("You may now chat with the assistant.");
-  console.log("To end the conversation, please type 'exit' or 'quit'.");
+  const myMCPClient = new MCPClient("You are an assistant who supports your user. You will have access to a list of tools and/or resources that you may need to respond to the user's messages properly.");
+
+  try {
+    await myMCPClient.connectToServer(process.argv[2]);
+    await myMCPClient.chatLoop();
+  } finally {
+    await myMCPClient.cleanup();
+    process.exit(0);
+  }
 }
+
+main();
